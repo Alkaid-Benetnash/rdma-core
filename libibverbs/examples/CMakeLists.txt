@@ -23,6 +23,8 @@ target_link_libraries(ibv_uc_pingpong LINK_PRIVATE ibverbs ibverbs_tools)
 
 rdma_executable(ibv_ud_pingpong ud_pingpong.c)
 target_link_libraries(ibv_ud_pingpong LINK_PRIVATE ibverbs ibverbs_tools)
+rdma_executable(ibv_ud_tp ud_tp.c)
+target_link_libraries(ibv_ud_tp LINK_PRIVATE ibverbs ibverbs_tools)
 
 rdma_executable(ibv_xsrq_pingpong xsrq_pingpong.c)
 target_link_libraries(ibv_xsrq_pingpong LINK_PRIVATE ibverbs ibverbs_tools)

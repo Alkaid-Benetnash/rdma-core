@@ -44,6 +44,8 @@
 #include <getopt.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <signal.h>
+#include <assert.h>
 
 #include "pingpong.h"
 
@@ -357,7 +359,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		goto clean_pd;
 	}
 
-        ctx->cq = ibv_create_cq(ctx->context, rx_depth + rx_depth, NULL,
+	ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
 				ctx->channel, 0);
 	if (!ctx->cq) {
 		fprintf(stderr, "Couldn't create CQ\n");
@@ -505,7 +507,7 @@ static int pp_post_recv(struct pingpong_context *ctx, int n)
 	return i;
 }
 
-static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn, int n)
+static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn)
 {
 	struct ibv_sge list = {
 		.addr	= (uintptr_t) ctx->buf + 40,
@@ -526,13 +528,9 @@ static int pp_post_send(struct pingpong_context *ctx, uint32_t qpn, int n)
 			 }
 		}
 	};
-        struct ibv_send_wr *bad_wr;
-        //return ibv_post_send(ctx->qp, &wr, &bad_wr);
-        int i;
-        for (i=0; i < n; ++i)
-            if(ibv_post_send(ctx->qp, &wr, &bad_wr))
-                break;
-        return i;
+	struct ibv_send_wr *bad_wr;
+
+	return ibv_post_send(ctx->qp, &wr, &bad_wr);
 }
 
 static void usage(const char *argv0)
@@ -553,29 +551,51 @@ static void usage(const char *argv0)
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
 }
 
+#define NSEC_RATIO 1000000000
+struct ibv_device      **dev_list;
+struct ibv_device	*ib_dev;
+struct pingpong_context *ctx;
+struct pingpong_dest     my_dest;
+struct pingpong_dest    *rem_dest;
+struct timeval           start, end;
+char                    *ib_devname = NULL;
+char                    *servername = NULL;
+unsigned int             port = 18515;
+int                      ib_port = 1;
+unsigned int             size = 2048;
+unsigned int             rx_depth = 500;
+unsigned int             iters = 1000;
+int                      use_event = 0;
+int                      routs;
+int                      num_cq_events = 0;
+int                      sl = 0;
+int			 gidx = -1;
+char			 gid[33];
+int rcnt, scnt;
+void siginthdl(int);
+void sigquithdl(int);
+void siginthdl(int dummy)
+{
+    static struct timespec begin_time;
+    struct timespec end_time;
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    double elapsed_sec = (end_time.tv_sec - begin_time.tv_sec - 1) + (double)(NSEC_RATIO + end_time.tv_nsec - begin_time.tv_nsec)/NSEC_RATIO;
+    fprintf(stderr, "recv pps %lf, send pps %lf\n", rcnt/elapsed_sec, scnt/elapsed_sec);
+    rcnt = scnt = 0;
+    begin_time = end_time;
+}
+
+void sigquithdl(int dummy)
+{
+    exit(0);
+}
+void *thread_server(void*);
+void *thread_client(void*);
+
 int main(int argc, char *argv[])
 {
-	struct ibv_device      **dev_list;
-	struct ibv_device	*ib_dev;
-	struct pingpong_context *ctx;
-	struct pingpong_dest     my_dest;
-	struct pingpong_dest    *rem_dest;
-	struct timeval           start, end;
-	char                    *ib_devname = NULL;
-	char                    *servername = NULL;
-	unsigned int             port = 18515;
-	int                      ib_port = 1;
-	unsigned int             size = 2048;
-	unsigned int             rx_depth = 500;
-	unsigned int             iters = 1000;
-	int                      use_event = 0;
-        int                      routs, souts;
-	int                      rcnt, scnt;
-	int                      num_cq_events = 0;
-	int                      sl = 0;
-	int			 gidx = -1;
-	char			 gid[33];
-
+        signal(SIGINT, siginthdl);
+        signal(SIGQUIT, sigquithdl);
 	srand48(getpid() * time(NULL));
 
 	while (1) {
@@ -705,7 +725,7 @@ int main(int argc, char *argv[])
 	}
 	my_dest.lid = ctx->portinfo.lid;
 
-	my_dest.qpn = ctx->qp->qp_num;
+        my_dest.qpn = ctx->qp->qp_num;
 	my_dest.psn = lrand48() & 0xffffff;
 
 	if (gidx >= 0) {
@@ -740,9 +760,13 @@ int main(int argc, char *argv[])
 			return 1;
 
 	ctx->pending = PINGPONG_RECV_WRID;
-        souts = pp_post_send(ctx, rem_dest->qpn, ctx->rx_depth);
+
 	if (servername) {
-                ctx->pending |= PINGPONG_SEND_WRID;
+		if (pp_post_send(ctx, rem_dest->qpn)) {
+			fprintf(stderr, "Couldn't post send\n");
+			return 1;
+		}
+		ctx->pending |= PINGPONG_SEND_WRID;
 	}
 
 	if (gettimeofday(&start, NULL)) {
@@ -775,11 +799,11 @@ int main(int argc, char *argv[])
 		}
 
 		{
-                        struct ibv_wc wc[16];
+			struct ibv_wc wc[2];
 			int ne, i;
 
 			do {
-                                ne = ibv_poll_cq(ctx->cq, sizeof(wc)/sizeof(wc[0]), wc);
+				ne = ibv_poll_cq(ctx->cq, 2, wc);
 				if (ne < 0) {
 					fprintf(stderr, "poll CQ failed %d\n", ne);
 					return 1;
@@ -796,9 +820,6 @@ int main(int argc, char *argv[])
 
 				switch ((int) wc[i].wr_id) {
 				case PINGPONG_SEND_WRID:
-                                        if (--souts <= 1) {
-                                            souts += pp_post_send(ctx, rem_dest->qpn, ctx->rx_depth - souts);
-                                        }
 					++scnt;
 					break;
 
@@ -821,13 +842,15 @@ int main(int argc, char *argv[])
 					return 1;
 				}
 
-//				ctx->pending &= ~(int) wc[i].wr_id;
-//                                if (scnt < iters && !ctx->pending) {
-//                                        pp_post_send(ctx, rem_dest->qpn, ctx->rx_depth);
-//                                        ctx->pending = PINGPONG_RECV_WRID |
-//						       PINGPONG_SEND_WRID;
-//				}
-                                fprintf(stderr, "scnt %d, rcnt %d, sout %d, rout %d\n", scnt, rcnt, souts, routs); fflush(stderr);
+				ctx->pending &= ~(int) wc[i].wr_id;
+				if (scnt < iters && !ctx->pending) {
+					if (pp_post_send(ctx, rem_dest->qpn)) {
+						fprintf(stderr, "Couldn't post send\n");
+						return 1;
+					}
+					ctx->pending = PINGPONG_RECV_WRID |
+						       PINGPONG_SEND_WRID;
+				}
 			}
 		}
 	}
@@ -857,4 +880,43 @@ int main(int argc, char *argv[])
 	free(rem_dest);
 
 	return 0;
+}
+
+void *thread_server(void *p)
+{
+    struct pingpong_dest *rem_dest = pp_server_exch_dest(ctx, ib_port, port, sl, &my_dest, gidx);
+    assert(rem_dest != NULL);
+    ctx->pending = PINGPONG_RECV_WRID;
+    struct ibv_sge list = {
+            .addr	= (uintptr_t) ctx->buf + 40,
+            .length = ctx->size,
+            .lkey	= ctx->mr->lkey
+    };
+    struct ibv_send_wr wr = {
+            .wr_id	    = PINGPONG_SEND_WRID,
+            .sg_list    = &list,
+            .num_sge    = 1,
+            .opcode     = IBV_WR_SEND,
+            .send_flags = ctx->send_flags,
+            .wr         = {
+                    .ud = {
+                             .ah          = ctx->ah,
+                             .remote_qpn  = rem_dest->qpn,
+                             .remote_qkey = 0x11111111
+                     }
+            }
+    };
+}
+
+void *thread_client(void *p)
+{
+    struct pingpong_dest *rem_dest = pp_client_exch_dest(servername, port, &my_dest);
+    assert(rem_dest != NULL);
+    pp_connect_ctx(ctx, ib_port, my_dest.psn, sl, rem_dest, gidx);
+    ctx->pending = PINGPONG_RECV_WRID;
+    if (pp_post_send(ctx, rem_dest->qpn)) {
+        fprintf(stderr, "Couldn't post send\n");
+        exit(1);
+    }
+    ctx->pending |= PINGPONG_SEND_WRID;
 }
