@@ -92,14 +92,13 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
 		.port_num      = port
 	};
 	struct ibv_qp_attr attr = {
-                .qp_state		= IBV_QPS_RTS,
+                .qp_state               = IBV_QPS_RTS,
                 .sq_psn                 = my_psn
 	};
 
 
-	if (ibv_modify_qp(ctx->qp, &attr,
-			  IBV_QP_STATE              |
-			  IBV_QP_SQ_PSN)) {
+        if (ibv_modify_qp(ctx->qp, &attr,
+                          IBV_QP_STATE | IBV_QP_SQ_PSN)) {
 		fprintf(stderr, "Failed to modify QP to RTS\n");
 		return 1;
 	}
@@ -358,7 +357,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		goto clean_pd;
 	}
 
-        ctx->send_cq = ibv_create_cq(ctx->context, rx_depth, NULL,
+        ctx->send_cq = ibv_create_cq(ctx->context, tx_depth, NULL,
 				ctx->channel, 0);
 
         ctx->recv_cq = ibv_create_cq(ctx->context, rx_depth, NULL,
@@ -377,7 +376,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
                                 .max_send_wr  = tx_depth,
 				.max_recv_wr  = rx_depth,
 				.max_send_sge = 1,
-				.max_recv_sge = 1
+                                .max_recv_sge = 1,.max_inline_data=256
 			},
 			.qp_type = IBV_QPT_UD,
 		};
@@ -390,6 +389,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 
 		ibv_query_qp(ctx->qp, &attr, IBV_QP_CAP, &init_attr);
 		if (init_attr.cap.max_inline_data >= size) {
+                        fprintf(stderr, "Use inline with %d\n", size);
 			ctx->send_flags |= IBV_SEND_INLINE;
 		}
 	}
@@ -419,6 +419,7 @@ clean_qp:
 
 clean_cq:
         ibv_destroy_cq(ctx->send_cq);
+        ibv_destroy_cq(ctx->recv_cq);
 
 clean_mr:
         ibv_dereg_mr(ctx->mr);
@@ -575,6 +576,7 @@ int                      sl = 0;
 int			 gidx = -1;
 char			 gid[33];
 int rcnt, scnt;
+int send_ne=-1, recv_ne=-1;
 void siginthdl(int);
 void sigquithdl(int);
 void siginthdl(int dummy)
@@ -583,7 +585,7 @@ void siginthdl(int dummy)
     struct timespec end_time;
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     double elapsed_sec = (end_time.tv_sec - begin_time.tv_sec - 1) + (double)(NSEC_RATIO + end_time.tv_nsec - begin_time.tv_nsec)/NSEC_RATIO;
-    fprintf(stderr, "in %4f sec, recv pps %lf, send pps %lf\n", elapsed_sec, rcnt/elapsed_sec, scnt/elapsed_sec);
+    fprintf(stderr, "in %4f sec, recv pps %lf, send pps %lf, recv_ne %d, send_ne %d\n", elapsed_sec, rcnt/elapsed_sec, scnt/elapsed_sec, recv_ne, send_ne);
     rcnt = scnt = 0;
     begin_time = end_time;
 }
@@ -777,7 +779,14 @@ int main(int argc, char *argv[])
 //		perror("gettimeofday");
 //		return 1;
 //	}
+        struct ibv_qp_attr attr = {
+            .qp_state = IBV_QPS_RTR
+        };
 
+        if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE)) {
+                perror("Failed to modify QP to RTR");
+                exit(-1);
+        }
 	rcnt = scnt = 0;
         pthread_t t1,t2,t3;
         pthread_create(&t1, NULL, thread_reply_local_addr, NULL);
@@ -825,15 +834,6 @@ void *thread_server(void *p)
     struct ibv_wc wc[CTX_POLL_BATCH];
     int ne;
 
-    struct ibv_qp_attr attr = {
-        .qp_state = IBV_QPS_RTR
-    };
-
-    if (ibv_modify_qp(ctx->qp, &attr, IBV_QP_STATE)) {
-            fprintf(stderr, "Failed to modify QP to RTR\n");
-            exit(-1);
-    }
-
     for (int i=0; i < ctx->rx_depth; ++i) {
         int ret = ibv_post_recv(ctx->qp, &wr, &bad_wr);
         if (ret) {
@@ -849,6 +849,8 @@ void *thread_server(void *p)
                 perror("poll recv CQ failed");
                 exit(-1);
             }
+            else
+                recv_ne = ne;
         } while (ne < 1);
         for (int i=0; i < ne; ++i) {
             if (wc[i].status != IBV_WC_SUCCESS) {
@@ -913,6 +915,8 @@ void *thread_client(void *p)
                 perror("poll send CQ failed");
                 exit(-1);
             }
+            else
+                send_ne = ne;
         } while (ne < 1);
         for (int i=0; i < ne; ++i) {
             if (wc[i].status != IBV_WC_SUCCESS) {
